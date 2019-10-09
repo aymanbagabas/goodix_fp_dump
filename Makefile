@@ -45,6 +45,13 @@ CFLAGS += -DTRACE
 
 all: goodix_fp_dump
 
+install_udev_rules: contrib/55-goodix.rules
+	sudo -v
+	install -d $(DESTDIR)/lib/udev/rules.d
+	install -m 644 contrib/55-goodix.rules $(DESTDIR)/lib/udev/rules.d
+	udevadm control --reload
+	usbreset $(lsusb -d 27c6: | cut -d ' ' -f 6)
+
 install: goodix_fp_dump
 	install -d $(DESTDIR)$(bindir)
 	install -m 755 goodix_fp_dump $(DESTDIR)$(bindir)
