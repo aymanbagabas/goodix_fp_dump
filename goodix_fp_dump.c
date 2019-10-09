@@ -936,20 +936,39 @@ out:
 }
 
 /* this is probably the message to get an image, together with 36 */
-static int get_msg_20(goodix_fp_device *dev)
+static int get_msg_20(goodix_fp_device *dev, uint16_t chip_id)
 {
 	int ret;
-	uint8_t request[4] = "\x01\x06\xcf\x00";
-	uint8_t image[14656] = { 0 };
-	uint16_t image_size = 0;
+	uint8_t request_2202[2] = "\x01\x00";
+	uint8_t request_220c[4] = "\x01\x06\xcf\x00";
+	uint8_t *request;
+	uint16_t request_size;
+	uint8_t response[32768] = { 0 };
+	uint16_t response_size = 0;
+
+	switch (chip_id) {
+	case 0x2202:
+		request = request_2202;
+		request_size = sizeof(request_2202);
+		break;
+	case 0x220c:
+		request = request_220c;
+		request_size = sizeof(request_220c);
+		break;
+	default:
+		error("Unknown chip id 0x%04x", chip_id);
+		ret = -EINVAL;
+		goto out;
+	}
+
 
 	ret = send_packet_full(dev, 0x20,
-			       request, sizeof(request),
-			       image, &image_size, false);
+			       request, request_size,
+			       response, &response_size, false);
 	if (ret < 0)
 		goto out;
 
-	debug_dump_buffer_to_file("payload_image.bin", image, image_size);
+	debug_dump_buffer_to_file("payload_image.bin", response, response_size);
 
 out:
 	return ret;
@@ -993,7 +1012,7 @@ static int init_device_2202(goodix_fp_device * dev)
 		goto out;
 	}
 
-	ret = get_msg_20(dev);
+	ret = get_msg_20(dev, 0x2202);
 	if (ret < 0) {
 		error("Error, cannot get message 0x20: %d\n", ret);
 		goto out;
@@ -1037,7 +1056,7 @@ static int init_device_220c(goodix_fp_device * dev)
 		goto out;
 	}
 
-	ret = get_msg_20(dev);
+	ret = get_msg_20(dev, 0x220c);
 	if (ret < 0) {
 		error("Error, cannot get message 0x20: %d\n", ret);
 		goto out;
