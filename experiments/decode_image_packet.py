@@ -13,6 +13,11 @@ import sys
 import crcmod
 
 
+# Hardcode image size for now
+WIDTH = 108
+HEIGHT = 88
+
+
 # The data passed is the raw image packet received from a Goodix fingerprint
 # reader, e.g. the Leftover Capture Data of a USB URB in a Wireshark capture.
 def extract_payload(data):
@@ -81,7 +86,7 @@ def unpack_data_to_16bit(data):
     return unpacked_values
 
 
-def save_as_16bit_le(unpacked_values):
+def save_as_16bit_le(unpacked_values, suffix=""):
     unpacked_data = []
 
     for value in unpacked_values:
@@ -91,15 +96,34 @@ def save_as_16bit_le(unpacked_values):
         unpacked_data.append(lower)
         unpacked_data.append(upper)
 
-    fout = open('unpacked_image.bin', 'wb+')
+    fout = open("unpacked_image%s.bin" % suffix, 'wb+')
     fout.write(bytearray(unpacked_data))
+    fout.close()
+
+
+def save_pgm(unpacked_values, suffix=""):
+    fout = open('unpacked_image%s.pgm' % suffix, 'w+')
+    fout.write('P2\n')
+    fout.write("%d %d\n" % (WIDTH, HEIGHT))
+
+    # 16bpp data
+    fout.write("4095\n")
+
+    for value in unpacked_values:
+        fout.write("%d\n" % value)
+
     fout.close()
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.stderr.write("usage: %s <datafile>\n" % sys.argv[0])
+        sys.stderr.write("usage: %s <datafile> [<suffix>]\n" % sys.argv[0])
         return 1
+
+    try:
+        suffix = "_" + sys.argv[2]
+    except IndexError:
+        suffix = ""
 
     fin = open(sys.argv[1], 'rb')
     buf = fin.read()
@@ -107,7 +131,7 @@ def main():
 
     payload = extract_payload(buf)
 
-    fout = open('payload.bin', 'wb+')
+    fout = open("payload%s.bin" % suffix, 'wb+')
     fout.write(bytearray(payload))
     fout.close()
 
@@ -115,7 +139,9 @@ def main():
     # (probably some header), and the last 4 bytes too as they should be a crc.
     image_data = payload[5:-4]
 
-    fout = open('image_data.bin', 'wb+')
+    assert len(image_data) == WIDTH * HEIGHT * 3 / 2
+
+    fout = open("image_data%s.bin" % suffix, 'wb+')
     fout.write(bytearray(image_data))
     fout.close()
 
@@ -129,13 +155,17 @@ def main():
     crc32_func = crcmod.predefined.mkCrcFun('crc-32-mpeg')
     calc_crc = crc32_func(image_data)
 
-    print(hex(data_crc))
-    print(hex(calc_crc))
+    #print(hex(data_crc))
+    #print(hex(calc_crc))
 
     assert data_crc == calc_crc
 
     unpacked_values = unpack_data_to_16bit(image_data)
-    save_as_16bit_le(unpacked_values)
+
+    assert len(unpacked_values) == WIDTH * HEIGHT
+
+    save_pgm(unpacked_values, suffix)
+    save_as_16bit_le(unpacked_values, suffix)
 
     return 0
 

@@ -16,7 +16,7 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-#define trace(...) fprintf(stderr, __VA_ARGS__)
+#define debug(...) fprintf(stderr, __VA_ARGS__)
 #define error(...) fprintf(stderr, __VA_ARGS__)
 #define warning(...) fprintf(stderr, __VA_ARGS__)
 
@@ -86,6 +86,14 @@ static const struct goodix_fp_usb_device_descriptor supported_devices[] = {
 		.output_endpoint = 0x03,
 		.input_endpoint = 0x81,
 	},
+	{
+		/* found on Dell G5 (2019) */
+		.vendor_id = 0x27c6,
+		.product_id = 0x530c,
+		.configuration = 1,
+		.output_endpoint = 0x01,
+		.input_endpoint = 0x83,
+	},
 };
 
 struct _goodix_fp_device {
@@ -96,9 +104,9 @@ struct _goodix_fp_device {
 typedef struct _goodix_fp_device goodix_fp_device;
 
 /*
- * The device expects umeric values as little-endian.
+ * The device expects numeric values as little-endian.
  *
- * Endian conversion is needed if the code is run on big-endian systems.
+ * XXX Proper endianness conversion is needed if the code is run on big-endian systems.
  */
 typedef union {
 	uint8_t data[64];
@@ -133,32 +141,33 @@ typedef enum {
 	GOODIX_FP_PACKET_TYPE_REPLY = 0xb0,
 	GOODIX_FP_PACKET_TYPE_FIRMWARE_VERSION = 0xa8,
 	GOODIX_FP_PACKET_TYPE_RESET = 0xa2,
+	GOODIX_FP_PACKET_TYPE_CHIP_REG_READ = 0x82,
 	GOODIX_FP_PACKET_TYPE_OTP = 0xa6,
 	GOODIX_FP_PACKET_TYPE_HANDSHAKE = 0xd2,
 	GOODIX_FP_PACKET_TYPE_PSK = 0xe4,
 	GOODIX_FP_PACKET_TYPE_CONFIG = 0x90,
 } goodix_fp_packet_type;
 
-static void trace_dump_buffer(const char *message, uint8_t *buffer, int len)
+static void debug_dump_buffer(const char *message, uint8_t *buffer, int len)
 {
 	int i;
 
 	if (buffer == NULL || len <= 0) {
-		trace("Invalid or empty buffer\n");
+		debug("Invalid or empty buffer\n");
 		return;
 	}
 
-	trace("\n");
+	debug("\n");
 	if (message)
-		trace("%s\n", message);
+		debug("%s\n", message);
 
 	for (i = 0; i < len; i++) {
-		trace("%02hhX%c", buffer[i], (((i + 1) % 16) && (i < len - 1)) ? ' ' : '\n');
+		debug("%02hhX%c", buffer[i], (((i + 1) % 16) && (i < len - 1)) ? ' ' : '\n');
 	}
-	trace("\n");
+	debug("\n");
 }
 
-static void trace_dump_buffer_to_file(const char *filename, uint8_t *buffer, int len)
+static void debug_dump_buffer_to_file(const char *filename, uint8_t *buffer, int len)
 {
 	FILE *fp;
 
@@ -174,6 +183,10 @@ static void trace_dump_buffer_to_file(const char *filename, uint8_t *buffer, int
 	fwrite(buffer, 1, len, fp);
 	fclose(fp);
 }
+
+#ifdef TRACE
+#define trace debug
+#define trace_dump_buffer debug_dump_buffer
 
 static void trace_out_packet(goodix_fp_out_packet *packet)
 {
@@ -193,6 +206,24 @@ static void trace_in_packet(goodix_fp_in_packet *packet)
 	trace("size: 0x%02hx %d\n", packet->fields.payload_size, packet->fields.payload_size);
 	trace("\n");
 }
+#else
+#define trace(...) do {} while(0)
+static void trace_dump_buffer(const char *message, uint8_t *buffer, int len)
+{
+	(void) message;
+	(void) buffer;
+	(void) len;
+}
+
+static void trace_out_packet(goodix_fp_out_packet *packet)
+{
+	(void) packet;
+}
+static void trace_in_packet(goodix_fp_in_packet *packet)
+{
+	(void) packet;
+}
+#endif
 
 static int usb_send_data(libusb_device_handle *dev, uint8_t out_ep,
 			 uint8_t *buffer, int len)
@@ -569,7 +600,14 @@ static int send_packet_simple(goodix_fp_device *dev,
 {
 	uint8_t payload[2] = { 0 };
 
-	return send_packet(dev, packet_type, payload, 2, response, response_size);
+	return send_packet(dev, packet_type, payload, sizeof(payload), response, response_size);
+}
+
+static int get_msg_00_change_mode_start(goodix_fp_device *dev)
+{
+	uint8_t payload[2] = { 0 };
+
+	return send_packet(dev, 0x00, payload, sizeof(payload), NULL, NULL);
 }
 
 static int get_msg_a8_firmware_version(goodix_fp_device *dev)
@@ -590,23 +628,98 @@ out:
 
 static int get_msg_a2_reset(goodix_fp_device *dev)
 {
-	uint8_t payload[2] = { 0x01, 0x14 };
-
-	return send_packet(dev, GOODIX_FP_PACKET_TYPE_RESET, payload, 2, NULL, NULL);
-}
-
-static int get_msg_82(goodix_fp_device *dev)
-{
 	int ret;
-	uint8_t payload[5] = {0x00, 0x00, 0x00, 0x04, 0x00 };
+	uint8_t payload[2] = { 0x05, 0x14 };
 	uint8_t response[32768] = { 0 };
 	uint16_t response_size = 0;
 
-	ret = send_packet(dev, 0x82, payload, 5, response, &response_size);
+	ret = send_packet(dev, GOODIX_FP_PACKET_TYPE_RESET,
+			  payload, sizeof(payload),
+			  response, &response_size);
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer("0x82 response: ", response, response_size);
+	debug_dump_buffer("0xa2 response: ", response, response_size);
+
+out:
+	return ret;
+
+}
+
+static void swap_each_2_bytes(uint8_t *buffer, uint16_t len)
+{
+	unsigned int i;
+	uint8_t tmp;
+
+	if (len < 2)
+		return;
+
+	for (i = 0; i < len; i += 2) {
+		tmp = buffer[i];
+		buffer[i] = buffer[i + 1];
+		buffer[i + 1] = tmp;
+	}
+}
+
+static int get_msg_82_chip_reg_read(goodix_fp_device *dev, uint16_t reg_start, uint16_t reg_size, uint8_t *response, uint16_t *response_size)
+{
+	int ret;
+	uint8_t chip_reg_read_payload[4] = { 0 };
+
+	/* The first two bytes are the register start position as big-endian. */
+	chip_reg_read_payload[0] = (reg_start >> 8) & 0xff;
+	chip_reg_read_payload[1] = reg_start & 0xff;
+
+	/* The remaining two bytes are the result size as big-endian. */
+	chip_reg_read_payload[2] = (reg_size >> 8) & 0xff;
+	chip_reg_read_payload[3] = reg_size & 0xff;
+
+	debug_dump_buffer("0x82 payload: ", chip_reg_read_payload, sizeof(chip_reg_read_payload));
+
+	ret = send_packet(dev, GOODIX_FP_PACKET_TYPE_CHIP_REG_READ, chip_reg_read_payload, sizeof(chip_reg_read_payload), response, response_size);
+	if (ret < 0)
+		goto out;
+
+	if (reg_size != *response_size) {
+		ret = -EINVAL;
+		error("Unexpected response size (expected: %d, got: %d)", reg_size, *response_size);
+		goto out;
+	}
+
+	debug_dump_buffer("0x82 response: ", response, *response_size);
+
+	/* 
+	 * Swap each 2 bytes because the response seems to be in some
+	 * mixed-endian order.
+	 */
+	swap_each_2_bytes(response, *response_size);
+
+out:
+	return ret;
+}
+
+static int get_msg_82_chip_reg_read_chip_id(goodix_fp_device *dev, uint32_t *chip_id)
+{
+	int ret;
+	uint8_t response[32768] = { 0 };
+	uint16_t response_size = 0;
+
+	ret = get_msg_82_chip_reg_read(dev, 0, 4, response, &response_size);
+	if (ret < 0)
+		goto out;
+
+	/* After swapping every 2 bytes, values are now in little-endian order */
+	/* XXX Proper endianness conversion is needed if the code is run on big-endian systems. */
+	*chip_id = 0;
+	*chip_id |= response[0];
+	*chip_id |= response[1] << 8;
+	*chip_id |= response[2] << 16;
+	*chip_id |= response[3] << 24;
+
+	/* Discard the least significant byte to get the chip_id */
+	*chip_id >>= 8;
+
+	debug("ChipId: 0x%04x\n\n", *chip_id);
 
 out:
 	return ret;
@@ -619,11 +732,11 @@ static int get_msg_a6_otp(goodix_fp_device *dev)
 	uint16_t otp_size;
 
 	ret = send_packet_simple(dev, GOODIX_FP_PACKET_TYPE_OTP,
-				 (uint8_t *)otp, &otp_size);
+				 otp, &otp_size);
 	if (ret < 0)
 		goto out;
-	trace_dump_buffer("OTP:", otp, otp_size);
-	trace_dump_buffer_to_file("payload_otp.bin", otp, otp_size);
+	debug_dump_buffer("OTP:", otp, otp_size);
+	debug_dump_buffer_to_file("payload_otp.bin", otp, otp_size);
 out:
 	return ret;
 }
@@ -664,8 +777,8 @@ static int get_msg_e4_psk(goodix_fp_device *dev)
 	 *   - for the HASH it should be 32 bytes representing a sha256 hash
 	 *     of something from the PSK, after unsealing the data
 	 */
-	trace_dump_buffer("PSK:", psk, psk_size);
-	trace_dump_buffer_to_file("payload_psk.bin", psk, psk_size);
+	debug_dump_buffer("PSK:", psk, psk_size);
+	debug_dump_buffer_to_file("payload_psk.bin", psk, psk_size);
 
 	ret = send_packet(dev, GOODIX_FP_PACKET_TYPE_PSK,
 			  request_hash, sizeof(request_hash),
@@ -673,8 +786,8 @@ static int get_msg_e4_psk(goodix_fp_device *dev)
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer("HASH:", hash, hash_size);
-	trace_dump_buffer_to_file("payload_hash.bin", hash, hash_size);
+	debug_dump_buffer("HASH:", hash, hash_size);
+	debug_dump_buffer_to_file("payload_hash.bin", hash, hash_size);
 
 out:
 	return ret;
@@ -696,7 +809,7 @@ static int get_msg_d2_handshake(goodix_fp_device *dev)
 	for (i = 0; i < 32; i++)
 		client_hello[i + 8] = 0;
 
-	trace_dump_buffer_to_file("client_random.bin", client_hello + 8, 32);
+	debug_dump_buffer_to_file("client_random.bin", client_hello + 8, 32);
 
 	ret = send_packet(dev,
 			  GOODIX_FP_PACKET_TYPE_HANDSHAKE,
@@ -705,10 +818,10 @@ static int get_msg_d2_handshake(goodix_fp_device *dev)
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer_to_file("server_random1.bin", server_identity + 8, 32);
-	trace_dump_buffer_to_file("server_random2.bin", server_identity + 8 + 32, 32);
+	debug_dump_buffer_to_file("server_random1.bin", server_identity + 8, 32);
+	debug_dump_buffer_to_file("server_random2.bin", server_identity + 8 + 32, 32);
 
-	trace_dump_buffer("server_identity:", server_identity, server_identity_size);
+	debug_dump_buffer("server_identity:", server_identity, server_identity_size);
 
 	/* Client reply is not constant, it depends on the server identity.  */
 
@@ -725,7 +838,7 @@ static int get_msg_d2_handshake(goodix_fp_device *dev)
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer("server_done:", server_done, server_done_size);
+	debug_dump_buffer("server_done:", server_done, server_done_size);
 
 	/* If we pass this point negotiation succeeded */
 	trace("Hurrah!\n");
@@ -734,37 +847,70 @@ out:
 	return ret;
 }
 
-static int get_msg_90_config(goodix_fp_device *dev)
+static int get_msg_90_config(goodix_fp_device *dev, uint16_t chip_id)
 {
 	int ret;
-	uint8_t config[256] = "\x40\x11\x6c\x7d\x28\xa5\x28\xcd\x1c\xe9\x10\xf9\x00\xf9\x00\xf9" \
-			       "\x00\x04\x02\x00\x00\x08\x00\x11\x11\xba\x00\x01\x80\xca\x00\x07" \
-			       "\x00\x84\x00\xbe\xb2\x86\x00\xc5\xb9\x88\x00\xb5\xad\x8a\x00\x9d" \
-			       "\x95\x8c\x00\x00\xbe\x8e\x00\x00\xc5\x90\x00\x00\xb5\x92\x00\x00" \
-			       "\x9d\x94\x00\x00\xaf\x96\x00\x00\xbf\x98\x00\x00\xb6\x9a\x00\x00" \
-			       "\xa7\x30\x00\x6c\x1c\x50\x00\x01\x05\xd0\x00\x00\x00\x70\x00\x00" \
-			       "\x00\x72\x00\x78\x56\x74\x00\x34\x12\x26\x00\x00\x12\x20\x00\x10" \
-			       "\x40\x12\x00\x03\x04\x02\x02\x16\x21\x2c\x02\x0a\x03\x2a\x01\x02" \
-			       "\x00\x22\x00\x01\x20\x24\x00\x32\x00\x80\x00\x05\x04\x5c\x00\x00" \
-			       "\x01\x56\x00\x28\x20\x58\x00\x01\x00\x32\x00\x24\x02\x82\x00\x80" \
-			       "\x0c\x20\x02\x88\x0d\x2a\x01\x92\x07\x22\x00\x01\x20\x24\x00\x14" \
-			       "\x00\x80\x00\x05\x04\x5c\x00\x9b\x00\x56\x00\x08\x20\x58\x00\x03" \
-			       "\x00\x32\x00\x08\x04\x82\x00\x80\x12\x20\x02\xf8\x0c\x2a\x01\x18" \
-			       "\x04\x5c\x00\x9b\x00\x54\x00\x00\x01\x62\x00\x09\x03\x64\x00\x18" \
-			       "\x00\x82\x00\x80\x0c\x20\x02\xf8\x0c\x2a\x01\x18\x04\x5c\x00\x9b" \
-			       "\x00\x52\x00\x08\x00\x54\x00\x00\x01\x00\x00\x00\x00\x00\x50\x5e";
+	uint8_t config_2202[256] = "\x08\x11\x54\x65\x24\x89\x24\xad\x1c\xc9\x1c\xe5\x04\xe9\x04\xed" \
+				    "\x13\xba\x00\x01\x00\xca\x00\x07\x00\x84\x00\x80\x81\x86\x00\x80" \
+				    "\x8c\x88\x00\x80\x97\x8a\x00\x80\xb0\x8c\x00\x80\x86\x8e\x00\x80" \
+				    "\x8c\x90\x00\x80\xa0\x92\x00\x80\xb3\x94\x00\x80\x84\x96\x00\x80" \
+				    "\x88\x98\x00\x80\xa0\x9a\x00\x80\xb8\x56\x00\x08\x28\x58\x00\x48" \
+				    "\x00\x70\x00\x01\x00\x72\x00\x78\x56\x74\x00\x34\x12\x26\x00\x00" \
+				    "\x12\xd0\x00\x00\x00\x20\x01\x02\x04\x20\x00\x10\x40\x22\x00\x01" \
+				    "\x20\x24\x00\x32\x00\x80\x00\x01\x04\x5c\x00\x80\x00\x28\x02\x00" \
+				    "\x00\x2a\x02\x00\x00\x82\x00\x80\x15\x20\x01\x82\x04\x20\x00\x10" \
+				    "\x40\x22\x00\x01\x20\x24\x00\x14\x00\x80\x00\x01\x04\x5c\x00\x00" \
+				    "\x01\x28\x02\x00\x00\x2a\x02\x00\x00\x82\x00\x80\x1a\x20\x01\x08" \
+				    "\x04\x22\x00\x10\x08\x80\x00\x01\x00\x5c\x00\x80\x00\x28\x02\x00" \
+				    "\x00\x2a\x02\x00\x00\x82\x00\x80\x15\x20\x01\x08\x04\x5c\x00\xf0" \
+				    "\x00\x50\x00\x01\x05\x52\x00\x08\x00\x54\x00\x10\x01\x28\x02\x00" \
+				    "\x00\x2a\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" \
+				    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x66\x2f";
+	uint8_t config_220c[256] = "\x40\x11\x6c\x7d\x28\xa5\x28\xcd\x1c\xe9\x10\xf9\x00\xf9\x00\xf9" \
+				    "\x00\x04\x02\x00\x00\x08\x00\x11\x11\xba\x00\x01\x80\xca\x00\x07" \
+				    "\x00\x84\x00\xbe\xb2\x86\x00\xc5\xb9\x88\x00\xb5\xad\x8a\x00\x9d" \
+				    "\x95\x8c\x00\x00\xbe\x8e\x00\x00\xc5\x90\x00\x00\xb5\x92\x00\x00" \
+				    "\x9d\x94\x00\x00\xaf\x96\x00\x00\xbf\x98\x00\x00\xb6\x9a\x00\x00" \
+				    "\xa7\x30\x00\x6c\x1c\x50\x00\x01\x05\xd0\x00\x00\x00\x70\x00\x00" \
+				    "\x00\x72\x00\x78\x56\x74\x00\x34\x12\x26\x00\x00\x12\x20\x00\x10" \
+				    "\x40\x12\x00\x03\x04\x02\x02\x16\x21\x2c\x02\x0a\x03\x2a\x01\x02" \
+				    "\x00\x22\x00\x01\x20\x24\x00\x32\x00\x80\x00\x05\x04\x5c\x00\x00" \
+				    "\x01\x56\x00\x28\x20\x58\x00\x01\x00\x32\x00\x24\x02\x82\x00\x80" \
+				    "\x0c\x20\x02\x88\x0d\x2a\x01\x92\x07\x22\x00\x01\x20\x24\x00\x14" \
+				    "\x00\x80\x00\x05\x04\x5c\x00\x9b\x00\x56\x00\x08\x20\x58\x00\x03" \
+				    "\x00\x32\x00\x08\x04\x82\x00\x80\x12\x20\x02\xf8\x0c\x2a\x01\x18" \
+				    "\x04\x5c\x00\x9b\x00\x54\x00\x00\x01\x62\x00\x09\x03\x64\x00\x18" \
+				    "\x00\x82\x00\x80\x0c\x20\x02\xf8\x0c\x2a\x01\x18\x04\x5c\x00\x9b" \
+				    "\x00\x52\x00\x08\x00\x54\x00\x00\x01\x00\x00\x00\x00\x00\x50\x5e";
+	uint8_t *config;
+	uint16_t config_size;
 	uint8_t response[32768] = { 0 };
 	uint16_t response_size = 0;
 
-	trace_dump_buffer("config:", config, sizeof(config));
+	switch (chip_id) {
+	case 0x2202:
+		config = config_2202;
+		config_size = sizeof(config_2202);
+		break;
+	case 0x220c:
+		config = config_220c;
+		config_size = sizeof(config_220c);
+		break;
+	default:
+		error("Unknown chip id 0x%04x", chip_id);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	debug_dump_buffer("config:", config, config_size);
 
 	ret = send_packet(dev, GOODIX_FP_PACKET_TYPE_CONFIG,
-			  config, sizeof(config),
+			  config, config_size,
 			  response, &response_size);
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer("0x90 response:", response, response_size);
+	debug_dump_buffer("0x90 response:", response, response_size);
 
 out:
 	return ret;
@@ -783,27 +929,46 @@ static int get_msg_36(goodix_fp_device *dev)
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer("0x36 response: ", response, response_size);
+	debug_dump_buffer("0x36 response: ", response, response_size);
 
 out:
 	return ret;
 }
 
 /* this is probably the message to get an image, together with 36 */
-static int get_msg_20(goodix_fp_device *dev)
+static int get_msg_20(goodix_fp_device *dev, uint16_t chip_id)
 {
 	int ret;
-	uint8_t request[4] = "\x01\x06\xcf\x00";
-	uint8_t image[14656] = { 0 };
-	uint16_t image_size = 0;
+	uint8_t request_2202[2] = "\x01\x00";
+	uint8_t request_220c[4] = "\x01\x06\xcf\x00";
+	uint8_t *request;
+	uint16_t request_size;
+	uint8_t response[32768] = { 0 };
+	uint16_t response_size = 0;
+
+	switch (chip_id) {
+	case 0x2202:
+		request = request_2202;
+		request_size = sizeof(request_2202);
+		break;
+	case 0x220c:
+		request = request_220c;
+		request_size = sizeof(request_220c);
+		break;
+	default:
+		error("Unknown chip id 0x%04x", chip_id);
+		ret = -EINVAL;
+		goto out;
+	}
+
 
 	ret = send_packet_full(dev, 0x20,
-			       request, sizeof(request),
-			       image, &image_size, false);
+			       request, request_size,
+			       response, &response_size, false);
 	if (ret < 0)
 		goto out;
 
-	trace_dump_buffer_to_file("payload_image.bin", image, image_size);
+	debug_dump_buffer_to_file("payload_image.bin", response, response_size);
 
 out:
 	return ret;
@@ -825,12 +990,92 @@ static int get_msg_32(goodix_fp_device *dev)
 
 #endif
 
+static int init_device_2202(goodix_fp_device * dev)
+{
+	int ret;
+
+	ret = get_msg_a6_otp(dev);
+	if (ret < 0) {
+		error("Error, cannot get OTP: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_90_config(dev, 0x2202);
+	if (ret < 0) {
+		error("Error, cannot set config: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_36(dev);
+	if (ret < 0) {
+		error("Error, cannot get message 0x36: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_20(dev, 0x2202);
+	if (ret < 0) {
+		error("Error, cannot get message 0x20: %d\n", ret);
+		goto out;
+	}
+
+out:
+	return ret;
+}
+
+static int init_device_220c(goodix_fp_device * dev)
+{
+	int ret;
+
+	ret = get_msg_a6_otp(dev);
+	if (ret < 0) {
+		error("Error, cannot get OTP: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_e4_psk(dev);
+	if (ret < 0) {
+		error("Error, cannot get message 0xe4: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_d2_handshake(dev);
+	if (ret < 0) {
+		error("Error, cannot perform handshake: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_90_config(dev, 0x220c);
+	if (ret < 0) {
+		error("Error, cannot set config: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_36(dev);
+	if (ret < 0) {
+		error("Error, cannot get message 0x36: %d\n", ret);
+		goto out;
+	}
+
+	ret = get_msg_20(dev, 0x220c);
+	if (ret < 0) {
+		error("Error, cannot get message 0x20: %d\n", ret);
+		goto out;
+	}
+
+out:
+	return ret;
+}
+
 static int init(goodix_fp_device *dev)
 {
 	int ret;
+	uint32_t chip_id;
+
+#if 0
 	uint8_t buffer[32768] = { 0 };
 
-	ret =libusb_control_transfer(dev->usb_device,
+	/* XXX some devices do not like these USB control transfers */
+	ret = libusb_control_transfer(dev->usb_device,
 				     LIBUSB_ENDPOINT_IN |
 				     LIBUSB_REQUEST_TYPE_VENDOR |
 				     LIBUSB_RECIPIENT_DEVICE,
@@ -852,6 +1097,14 @@ static int init(goodix_fp_device *dev)
 	}
 	trace_dump_buffer("<-- received", buffer, ret);
 
+#endif
+
+	ret = get_msg_00_change_mode_start(dev);
+	if (ret < 0) {
+		error("Error, cannot change mode to 0x00: %d\n", ret);
+		goto out;
+	}
+
 	ret = get_msg_a8_firmware_version(dev);
 	if (ret < 0) {
 		error("Error, cannot get Firmware version: %d\n", ret);
@@ -864,50 +1117,56 @@ static int init(goodix_fp_device *dev)
 		goto out;
 	}
 
-	ret = get_msg_82(dev);
+	ret = get_msg_82_chip_reg_read_chip_id(dev, &chip_id);
 	if (ret < 0) {
-		error("Error, cannot get message 0x82: %d\n", ret);
+		error("Error, cannot get chip id: %d\n", ret);
 		goto out;
 	}
 
-	ret = get_msg_a6_otp(dev);
-	if (ret < 0) {
-		error("Error, cannot get OTP: %d\n", ret);
+	switch (chip_id) {
+	case 0x220c:
+		return init_device_220c(dev);
+	case 0x2202:
+		return init_device_2202(dev);
+	case 0x2207:
+	case 0x2208:
+		error("Unsupported device type 0x%04x", chip_id);
+		ret = -ENOTSUP;
 		goto out;
-	}
-
-	ret = get_msg_e4_psk(dev);
-	if (ret < 0) {
-		error("Error, cannot get message 0xe4: %d\n", ret);
-		goto out;
-	}
-
-	ret = get_msg_d2_handshake(dev);
-	if (ret < 0) {
-		error("Error, cannot perform handshake: %d\n", ret);
-		goto out;
-	}
-
-	ret = get_msg_90_config(dev);
-	if (ret < 0) {
-		error("Error, cannot set config: %d\n", ret);
-		goto out;
-	}
-
-	ret = get_msg_36(dev);
-	if (ret < 0) {
-		error("Error, cannot get message 0x36: %d\n", ret);
-		goto out;
-	}
-
-	ret = get_msg_20(dev);
-	if (ret < 0) {
-		error("Error, cannot get message 0x20: %d\n", ret);
+	default:
+		error("Unknown device type 0x%04x", chip_id);
+		ret = -EINVAL;
 		goto out;
 	}
 
 out:
 	return ret;
+}
+
+static int goodix_fp_init(void)
+{
+	int ret;
+
+	ret = libusb_init(NULL);
+	if (ret < 0) {
+		fprintf(stderr, "libusb_init failed: %s\n",
+			libusb_error_name(ret));
+		goto out;
+	}
+
+#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000106)
+	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, 3);
+#else
+	libusb_set_debug(NULL, 3);
+#endif
+
+out:
+	return ret;
+}
+
+static void goodix_fp_shutdown(void)
+{
+	libusb_exit(NULL);
 }
 
 /* dev is only populated when the function returns 0 */
@@ -1044,29 +1303,20 @@ int main(void)
 	goodix_fp_device *dev;
 	int ret;
 
-	ret = libusb_init(NULL);
-	if (ret < 0) {
-		fprintf(stderr, "libusb_init failed: %s\n",
-			libusb_error_name(ret));
+	ret = goodix_fp_init();
+	if (ret < 0)
 		goto out;
-	}
-
-#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000106)
-	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, 3);
-#else
-	libusb_set_debug(NULL, 3);
-#endif
 
 	ret = goodix_fp_device_open(&dev);
 	if (ret < 0)
-		goto out_libusb_exit;
+		goto out_shutdown;
 
 	ret = init(dev);
 
 	goodix_fp_device_close(dev);
 
-out_libusb_exit:
-	libusb_exit(NULL);
+out_shutdown:
+	goodix_fp_shutdown();
 out:
 	return ret;
 }
