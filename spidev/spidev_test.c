@@ -454,6 +454,23 @@ static void transfer_buf(int fd, int len)
 	free(tx);
 }
 
+static void init_device(int fd) {
+	goodix_fp_out_packet packet = {
+		.fields = {
+			.type = 0,
+			.payload_size = 2 + 1,
+			.payload = { 0 }
+		}
+	};
+	goodix_fp_in_packet reply = {
+		.data = { 0 }
+	};
+	packet.fields.payload[2] = calc_checksum(0, packet.fields.payload, 2);
+
+	transfer(fd, packet.data, NULL, sizeof(packet.data));
+	transfer(fd, NULL, reply.data, sizeof(reply.data));
+}
+
 static void get_msg_a8_firmware_version(int fd) {
 	goodix_fp_out_packet packet = {
 		.fields = {
@@ -545,7 +562,7 @@ int main(int argc, char *argv[])
 		printf("total: tx %.1fKB, rx %.1fKB\n",
 		       _write_count/1024.0, _read_count/1024.0);
 	} else {
-		/* transfer(fd, default_tx, default_rx, sizeof(default_tx)); */
+		init_device(fd);
 		// firmware version
 		get_msg_a8_firmware_version(fd);
 	}
